@@ -1,58 +1,68 @@
-// Cloudflare Worker: generic fetch proxy for cmn_fetch() fallback chain.
-// Deploy this same script under several DIFFERENT worker names (e.g. via
-// dash.cloudflare.com > Workers & Pages > Create Worker) so requests spread
-// across more edge PoPs / outbound IPs — free tier covers 100k requests/day
-// per worker.
+// Updated beon-live2.vercel.app/api function: same request-forwarding logic as
+// before, plus Client Hints + Sec-Fetch-* headers so the outgoing request looks
+// like a real Chrome navigation (their absence is itself a bot signal to some
+// WAFs, on top of the User-Agent string).
 //
-// Usage: https://<your-worker-name>.<your-subdomain>.workers.dev/?url=<url-encoded target>
+// Note: Vercel's own IP ranges are broadly recognized as "datacenter/hosting" by
+// many anti-bot systems, so this header change alone may not be enough to make
+// CimaNow accept requests from Vercel specifically — worth testing, but the
+// Cloudflare Workers remain the more reliable proxy for this target.
 
-export default {
-  async fetch(request) {
-    const reqUrl = new URL(request.url);
-    const target = reqUrl.searchParams.get('url');
-
-    if (!target) {
-      return new Response('Missing url parameter', { status: 400 });
-    }
-
-    let parsed;
-    try {
-      parsed = new URL(target);
-    } catch {
-      return new Response('Invalid url parameter', { status: 400 });
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return new Response('Unsupported protocol', { status: 400 });
-    }
-
-    try {
-      const upstream = await fetch(parsed.toString(), {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-          'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
-          'Referer': `${parsed.protocol}//${parsed.host}/`,
-          // Client Hints + Sec-Fetch-*: a real Chrome navigation always sends these: their
-          // absence is itself a bot signal some WAFs check for, on top of the UA string.
-          'Sec-Ch-Ua': '"Chromium";v="124", "Not(A:Brand";v="24", "Google Chrome";v="124"',
-          'Sec-Ch-Ua-Mobile': '?0',
-          'Sec-Ch-Ua-Platform': '"Windows"',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'same-origin'
-        },
-        redirect: 'follow'
-      });
-
-      const body = await upstream.text();
-      return new Response(body, {
-        status: upstream.status,
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
-      });
-    } catch (err) {
-      return new Response('Proxy fetch failed: ' + (err && err.message ? err.message : 'unknown error'), { status: 502 });
-    }
+export default async function handler(req, res) {
+  const targetUrl = req.query.url;
+  if (!targetUrl) {
+    return res.status(400).send('Missing url parameter. Usage: ?url=https://example.com');
   }
-};
+
+  try {
+    let targetOrigin = '';
+    try {
+      targetOrigin = new URL(targetUrl).origin;
+    } catch (e) {}
+
+    let referer = req.headers['x-referer'] || req.headers['referer'] || '';
+    if (!referer || referer.includes('vercel.app') || referer.includes('localhost') || targetUrl.includes('Server.php')) {
+      referer = targetOrigin ? (targetOrigin + '/') : 'https://topcinema.io/';
+    }
+
+    const fetchOptions = {
+      method: req.method || 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8',
+        'Referer': referer,
+        'Sec-Ch-Ua': '"Chromium";v="124", "Not(A:Brand";v="24", "Google Chrome";v="124"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+      }
+    };
+
+    if (req.method === 'POST') {
+      let bodyData = '';
+      if (typeof req.body === 'string') {
+        bodyData = req.body;
+      } else if (req.body && typeof req.body === 'object') {
+        bodyData = new URLSearchParams(req.body).toString();
+      }
+      if (bodyData) {
+        fetchOptions.body = bodyData;
+        fetchOptions.headers['Content-Type'] = req.headers['content-type'] || 'application/x-www-form-urlencoded; charset=UTF-8';
+        fetchOptions.headers['X-Requested-With'] = 'XMLHttpRequest';
+      }
+    }
+
+    const response = await fetch(targetUrl, fetchOptions);
+    const data = await response.text();
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Content-Type', response.headers.get('content-type') || 'text/html; charset=UTF-8');
+    return res.status(response.status).send(data);
+  } catch (err) {
+    return res.status(500).send('Proxy error: ' + err.message);
+  }
+}
